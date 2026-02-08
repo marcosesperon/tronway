@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>TRONWAY - Juego de la Vida 3D interactivo</title>
+    <meta name="description" content="TRONWAY: visualización 3D interactiva del Juego de la Vida de Conway con modos de juego, efecto neón, múltiples mundos y geometrías. Construido con Three.js.">
+    <meta name="keywords" content="TRONWAY, Game of Life, Conway, 3D, Three.js, autómata celular, simulación, juego interactivo, WebGL, neón">
+    <meta name="author" content="TRONWAY">
+    <meta name="robots" content="index, follow">
+    <meta name="theme-color" content="#00f2ff">
+    <!-- Open Graph -->
+    <meta property="og:title" content="TRONWAY - Juego de la Vida 3D interactivo">
+    <meta property="og:description" content="Visualización 3D del Juego de la Vida con modos Supervivencia y Conquista, efecto neón, mundos esféricos, toroidales y procedurales.">
+    <meta property="og:type" content="website">
+    <meta property="og:locale" content="es_ES">
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="TRONWAY - Juego de la Vida 3D interactivo">
+    <meta name="twitter:description" content="Visualización 3D del Juego de la Vida con modos Supervivencia y Conquista, efecto neón y múltiples mundos.">
+    <link rel="stylesheet" href="style.css">
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "./three.module.js",
+                "three/addons/": "./addons/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="ambient-bg">
+        <div class="ambient-layer a1"></div>
+        <div class="ambient-layer a2"></div>
+        <div class="ambient-layer a3"></div>
+        <div class="ambient-layer a4"></div>
+    </div>
+    <div id="intro-overlay">
+        <div id="intro-line"></div>
+        <div id="intro-title">TRONWAY</div>
+        <div id="intro-subtitle">Game of Life 3D</div>
+        <div id="intro-scanline"></div>
+        <div id="intro-hint">Click para entrar</div>
+    </div>
+
+    <div id="reboot-overlay">
+        <div id="reboot-content">
+            <div id="reboot-status"></div>
+            <div id="reboot-line"></div>
+            <div id="reboot-stats">
+                <div class="reboot-stat">
+                    <div class="reboot-stat-value" id="reboot-gen">0</div>
+                    <div class="reboot-stat-label">Generaciones</div>
+                </div>
+                <div class="reboot-stat">
+                    <div class="reboot-stat-value" id="reboot-pop">0</div>
+                    <div class="reboot-stat-label">Poblaci&oacute;n</div>
+                </div>
+                <div class="reboot-stat">
+                    <div class="reboot-stat-value" id="reboot-stable">0</div>
+                    <div class="reboot-stat-label">Estables</div>
+                </div>
+                <div class="reboot-stat">
+                    <div class="reboot-stat-value" id="reboot-peak">0</div>
+                    <div class="reboot-stat-label">Pico m&aacute;x</div>
+                </div>
+            </div>
+        </div>
+        <div id="reboot-timer">REBOOT <span id="timer">10</span></div>
+    </div>
+
+    <div id="ui-panel" class="collapsed">
+        <div id="panel-header">
+            <div id="status-box">SCAN...</div>
+            <div>
+                <span id="fullscreenBtn" title="Pantalla completa">&#x26F6;</span>
+                <span id="toggleBtn">&#9776;</span>
+            </div>
+        </div>
+        <div id="controls-wrapper" style="display: none;">
+            <span class="label">MODO</span>
+            <select id="gameMode">
+                <option value="visualization" selected>Visualización</option>
+                <option value="survival">Supervivencia</option>
+                <option value="conquest">Conquista</option>
+            </select>
+            <div style="margin-bottom: 8px;"></div>
+
+            <span class="label">MOVIMIENTO CÁMARA</span>
+            <select id="cameraMode">
+                <option value="off" selected>Desactivado</option>
+                <option value="orbit">Órbita</option>
+                <option value="cinematic">Cinematográfico</option>
+            </select>
+            <div style="margin-bottom: 8px;"></div>
+
+            <div class="viz-only">
+            <span class="label">TIPO DE MUNDO</span>
+            <select id="worldSelect">
+                <option value="plane" selected>Plano Bidimensional</option>
+                <option value="sphere">Mundo Esférico</option>
+                <option value="torus">Donut (Toroide)</option>
+                <option value="procedural">Terreno Procedural</option>
+            </select>
+            <div style="margin-bottom: 8px;"></div>
+
+            <span class="label">OPACIDAD MUNDO</span>
+            <input type="range" id="worldOpacity" min="0" max="1" value="0" step="0.01">
+            </div>
+
+            <span class="label">GEOMETRÍA CÉLULA</span>
+            <select id="shapeSelect">
+                <option value="box">Barras</option>
+                <option value="sphere">Esferas</option>
+                <option value="pyramid">Pirámides</option>
+                <option value="donut">Toros</option>
+            </select>
+            <div style="margin-bottom: 8px;"></div>
+
+            <div class="control-row">
+                <span class="label" style="margin-bottom: 0;">EFECTO NEÓN</span>
+                <label class="switch">
+                    <input type="checkbox" id="neonToggle" checked>
+                    <span class="slider"></span>
+                </label>
+            </div>
+            <div class="control-row">
+                <span class="label" style="margin-bottom: 0;">FONDO AMBIENTE</span>
+                <label class="switch">
+                    <input type="checkbox" id="ambientToggle" checked>
+                    <span class="slider"></span>
+                </label>
+            </div>
+            <div style="margin-bottom: 8px;"></div>
+
+            <div class="viz-only">
+            <span class="label">REGLAS (B/S)</span>
+            <select id="rulesSelect">
+                <option value="conway" selected>Conway (B3/S23)</option>
+                <option value="highlife">HighLife (B36/S23)</option>
+                <option value="daynight">Day & Night (B3678/S34678)</option>
+                <option value="seeds">Seeds (B2/S)</option>
+                <option value="diamoeba">Diamoeba (B35678/S5678)</option>
+                <option value="2x2">2x2 (B36/S125)</option>
+                <option value="morley">Morley (B368/S245)</option>
+                <option value="anneal">Anneal (B4678/S35678)</option>
+                <option value="replicator">Replicator (B1357/S1357)</option>
+                <option value="maze">Maze (B3/S12345)</option>
+            </select>
+            <div style="margin-bottom: 8px;"></div>
+            </div>
+
+            <span class="label">FILAS (X): <span id="rowsVal">140</span></span>
+            <input type="range" id="rowsRange" min="20" max="200" value="140" step="10">
+
+            <span class="label">COLUMNAS (Z): <span id="colsVal">80</span></span>
+            <input type="range" id="colsRange" min="20" max="200" value="80" step="10">
+
+            <span class="label">VELOCIDAD</span>
+            <input type="range" id="speedRange" min="30" max="800" value="680">
+            <div class="game-only" style="margin-bottom: 2px;">
+            <span class="label">CÉLULAS: <span id="budgetVal">20</span></span>
+            <input type="range" id="budgetRange" min="5" max="100" value="20" step="5">
+
+            <span class="label">GENERACIONES: <span id="genLimitVal">100</span></span>
+            <input type="range" id="genLimitRange" min="0" max="500" value="100" step="10">
+            </div>
+
+            <button id="resetBtn">REINICIAR MUNDO</button>
+            <button id="pauseBtn" class="game-only">⏸ PAUSA</button>
+            <div id="game-tooltip"></div>
+        </div>
+        <table id="stats">
+            <tr class="stats-header">
+                <td title="Generación: número de ciclos de evolución desde el último reinicio">Generación</td>
+                <td title="Población: número total de células vivas en la generación actual">Población</td>
+                <td title="Estables: células que llevan al menos 3 generaciones consecutivas vivas sin cambiar">Estables</td>
+            </tr>
+            <tr class="stats-values">
+                <td><span id="genCount">0</span></td>
+                <td><span id="popCount">0</span></td>
+                <td><span id="patternCount">0</span></td>
+            </tr>
+        </table>
+        <div id="game-info" class="game-only">
+            <table id="game-stats">
+                <tr class="stats-header">
+                    <td>Células</td><td>Objetivo</td><td>Puntos</td>
+                </tr>
+                <tr class="stats-values">
+                    <td><span id="cellsRemaining">0</span></td>
+                    <td><span id="gameTarget">-</span></td>
+                    <td><span id="gameScore">0</span></td>
+                </tr>
+            </table>
+        </div>
+    </div>
+
+    <script type="module" src="main.js"></script>
+</body>
+</html>
