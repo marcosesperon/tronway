@@ -14,6 +14,9 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 
+// Nucleo puro de la simulacion (compartido con el Web Worker)
+import { calcular_siguiente_generacion } from './simulacion.js';
+
 // =====================================================================
 // CONFIGURACION DEL GRID
 // =====================================================================
@@ -49,6 +52,46 @@ let lastStepTime = 0;          // timestamp del ultimo paso de simulacion
 let simulationSpeed = 150;     // intervalo entre generaciones en ms (configurable 30-800)
 let popHistory = [];           // historial de poblacion (ultimas 40 generaciones)
 let generationCount = 0;       // contador de generaciones desde el ultimo reset
+
+// Buffer para rebobinar: guarda copias del grid de las ultimas generaciones
+let rewindBuffer = [];
+const REWIND_MAX = 40;         // numero maximo de generaciones que se pueden deshacer
+
+// =====================================================================
+// WEB WORKER DE LA SIMULACION
+// =====================================================================
+// El calculo de cada generacion se delega a un worker para no bloquear
+// el hilo de render en grids grandes. Si el worker no puede crearse
+// (entorno sin soporte, file://, etc.), simWorker queda null y la
+// simulacion se calcula de forma sincrona en el hilo principal.
+let simWorker = null;
+let workerBusy = false;        // true mientras el worker procesa un paso
+let ignorarResultado = false;  // descartar el resultado en vuelo si el grid se reinicia
+
+try {
+    simWorker = new Worker(new URL('./simulacion.worker.js', import.meta.url), { type: 'module' });
+    simWorker.onmessage = function(e) {
+        workerBusy = false;
+        // Si el grid se reinicio mientras el worker calculaba, descartar el resultado
+        if (ignorarResultado) { ignorarResultado = false; return; }
+        var d = e.data;
+        aplicar_resultado_paso(d.nextGrid, d.patternMap, d.nacidas, d.vivas, d.estables);
+    };
+    simWorker.onerror = function() { simWorker = null; workerBusy = false; };
+} catch (e) {
+    simWorker = null;
+}
+
+/**
+ * invalidar_paso_worker — Marca el resultado en vuelo del worker como obsoleto
+ *
+ * Se invoca antes de reiniciar/sustituir el grid fuera del flujo del worker
+ * (reset, resize, cambio de modo, estampar, rebobinar) para evitar que un
+ * resultado tardio sobrescriba el nuevo estado.
+ */
+function invalidar_paso_worker() {
+    if (workerBusy) ignorarResultado = true;
+}
 
 // =====================================================================
 // VARIABLES DEL SISTEMA DE REBOOT
@@ -92,6 +135,35 @@ let currentWorld = 'plane';        // tipo de mundo: plane | sphere | torus | pr
 let currentRules = 'conway';       // variante de reglas del automata celular
 let currentCameraMode = 'off';     // modo de camara: off | orbit | cinematic
 let neonGlowEnabled = true;        // efecto neon activado/desactivado
+let ageColorEnabled = false;       // colorear celulas segun su edad (generaciones vivas)
+
+// cellAge[] — generaciones consecutivas que lleva viva cada celula (0 = muerta).
+// Se mantiene en updateSimulation; alimenta el coloreado por edad.
+let cellAge = [];
+
+// =====================================================================
+// TEMAS DE COLOR
+// =====================================================================
+// Cada tema define el color de las celulas en la escena 3D:
+//   hueBase  — matiz HSL base de las celulas vivas (0-1)
+//   acento   — color hex del mundo, malla de referencia y overlay de reboot
+//   estable  — color RGB (valores >1 para activar el bloom) de celulas estables
+const temas = {
+    tron:    { hueBase: 0.50, acento: 0x00f2ff, estable: [2.5, 0.6, 0.0] },
+    ambar:   { hueBase: 0.09, acento: 0xffae00, estable: [2.5, 1.2, 0.0] },
+    magenta: { hueBase: 0.85, acento: 0xff2bd6, estable: [2.5, 0.0, 1.2] },
+    fosforo: { hueBase: 0.33, acento: 0x39ff14, estable: [1.8, 2.5, 0.0] }
+};
+let temaActual = 'tron';
+
+/**
+ * obtener_acento — Devuelve el color de acento (hex) del tema activo
+ *
+ * Usado para el mundo, la malla de referencia y el overlay de reboot.
+ */
+function obtener_acento() {
+    return temas[temaActual].acento;
+}
 
 // =====================================================================
 // CAMARA CINEMATOGRAFICA
@@ -152,8 +224,73 @@ const rules = {
     morley:     { birth: [3, 6, 8],        survival: [2, 4, 5] },
     anneal:     { birth: [4, 6, 7, 8],     survival: [3, 5, 6, 7, 8] },
     replicator: { birth: [1, 3, 5, 7],     survival: [1, 3, 5, 7] },
-    maze:       { birth: [3],              survival: [1, 2, 3, 4, 5] }
+    maze:       { birth: [3],              survival: [1, 2, 3, 4, 5] },
+    // 'custom' se rellena en tiempo de ejecucion a partir del input de texto
+    // (notacion B/S). Inicia como una copia de Conway por defecto.
+    custom:     { birth: [3],              survival: [2, 3] }
 };
+
+// =====================================================================
+// BIBLIOTECA DE PATRONES CLASICOS
+// =====================================================================
+// Cada patron es una lista de celulas vivas en coordenadas relativas
+// [fila, columna] respecto a su esquina superior izquierda. Al estampar
+// se centran en el grid (ver estampar_patron).
+const patrones = (function construir_patrones() {
+    // Pulsar (periodo 3): barras simetricas dentro de una rejilla 13x13
+    const v_pulsar = [];
+    const v_barras = [2, 3, 4, 8, 9, 10];
+    for (const v_f of [0, 5, 7, 12]) for (const v_c of v_barras) v_pulsar.push([v_f, v_c]);
+    for (const v_c of [0, 5, 7, 12]) for (const v_f of v_barras) v_pulsar.push([v_f, v_c]);
+
+    return {
+        glider:  [[0,1],[1,2],[2,0],[2,1],[2,2]],
+        lwss:    [[0,1],[0,4],[1,0],[2,0],[2,4],[3,0],[3,1],[3,2],[3,3]],
+        blinker: [[0,0],[0,1],[0,2]],
+        block:   [[0,0],[0,1],[1,0],[1,1]],
+        beacon:  [[0,0],[0,1],[1,0],[1,1],[2,2],[2,3],[3,2],[3,3]],
+        pulsar:  v_pulsar,
+        // Canon de planeadores de Gosper: emite un glider cada 30 generaciones
+        gun: [
+            [0,24],
+            [1,22],[1,24],
+            [2,12],[2,13],[2,20],[2,21],[2,34],[2,35],
+            [3,11],[3,15],[3,20],[3,21],[3,34],[3,35],
+            [4,0],[4,1],[4,10],[4,16],[4,20],[4,21],
+            [5,0],[5,1],[5,10],[5,14],[5,16],[5,17],[5,22],[5,24],
+            [6,10],[6,16],[6,24],
+            [7,11],[7,15],
+            [8,12],[8,13]
+        ]
+    };
+})();
+
+// =====================================================================
+// DESAFIOS (modo Puzzle)
+// =====================================================================
+// Cada desafio fija reglas, presupuesto de celulas y un objetivo de
+// victoria. Tipos de objetivo:
+//   poblacion     — alcanzar una poblacion viva >= valor
+//   supervivencia — sobrevivir >= valor generaciones
+//   puntos        — acumular >= valor de poblacion total (suma por generacion)
+const desafios = [
+    { id: 'explosion',   nombre: 'Explosión',   reglas: 'conway',   budget: 10,
+      objetivo: { tipo: 'poblacion', valor: 200 },
+      descripcion: 'Alcanza una población de <strong>200</strong> células partiendo de solo 10.' },
+    { id: 'minimalista', nombre: 'Minimalista', reglas: 'conway',   budget: 5,
+      objetivo: { tipo: 'poblacion', valor: 80 },
+      descripcion: 'Alcanza <strong>80</strong> de población usando solo <strong>5</strong> células.' },
+    { id: 'resistencia', nombre: 'Resistencia', reglas: 'conway',   budget: 12,
+      objetivo: { tipo: 'supervivencia', valor: 80 },
+      descripcion: 'Sobrevive <strong>80</strong> generaciones sin extinguirte ni estabilizarte.' },
+    { id: 'replicante',  nombre: 'Replicante',  reglas: 'highlife', budget: 15,
+      objetivo: { tipo: 'poblacion', valor: 300 },
+      descripcion: 'Con reglas <strong>HighLife</strong>, haz crecer la población hasta <strong>300</strong>.' },
+    { id: 'maraton',     nombre: 'Maratón',     reglas: 'conway',   budget: 20,
+      objetivo: { tipo: 'puntos', valor: 5000 },
+      descripcion: 'Acumula <strong>5000</strong> puntos de población total (suma por generación).' }
+];
+let desafioActual = 0;   // indice del desafio seleccionado en el modo Puzzle
 
 /**
  * getNoiseHeight — Genera altura de terreno procedural
@@ -184,7 +321,17 @@ function getNoiseHeight(x, z, seed) {
 // en la clave 'tronway_settings'. Se restauran al cargar la pagina
 // (antes de init) y se guardan en cada cambio de control.
 
-var STORAGE_KEY = 'tronway_settings';
+var STORAGE_KEY = 'tronway_settings';        // clave de los ajustes
+var SCORES_KEY = 'tronway_scores';           // clave de los records de juego
+var TUTORIAL_KEY = 'tronway_tutorial_seen';  // flag del mini-tutorial
+
+// Claves de control serializadas en localStorage y en la URL compartible.
+// Se declaran aqui (no junto a sus funciones) porque restaurar_ajustes y el
+// arranque las usan antes de llegar a esas secciones del fichero.
+var AJUSTES_STR = ['gameMode','cameraMode','worldSelect','worldOpacity','shapeSelect',
+    'themeSelect','rulesSelect','customRule','puzzleSelect','rowsRange','colsRange',
+    'speedRange','budgetRange','genLimitRange'];
+var AJUSTES_BOOL = ['neonToggle','ambientToggle','ageColorToggle','audioToggle'];
 
 /**
  * guardar_ajustes — Serializa el estado actual de los controles a localStorage
@@ -201,7 +348,12 @@ function guardar_ajustes() {
         shapeSelect: document.getElementById('shapeSelect').value,
         neonToggle: document.getElementById('neonToggle').checked,
         ambientToggle: document.getElementById('ambientToggle').checked,
+        ageColorToggle: document.getElementById('ageColorToggle').checked,
+        audioToggle: document.getElementById('audioToggle').checked,
+        themeSelect: document.getElementById('themeSelect').value,
         rulesSelect: document.getElementById('rulesSelect').value,
+        customRule: document.getElementById('customRuleInput').value,
+        puzzleSelect: document.getElementById('puzzleSelect').value,
         rowsRange: document.getElementById('rowsRange').value,
         colsRange: document.getElementById('colsRange').value,
         speedRange: document.getElementById('speedRange').value,
@@ -222,21 +374,27 @@ function guardar_ajustes() {
  * error, se usan los valores por defecto del HTML.
  */
 function restaurar_ajustes() {
-    var json;
+    // Base: ajustes guardados en localStorage
+    var a = {};
     try {
-        json = localStorage.getItem(STORAGE_KEY);
-    } catch (e) { return; }
-    if (!json) return;
-    var a;
-    try {
-        a = JSON.parse(json);
-    } catch (e) { return; }
+        var json = localStorage.getItem(STORAGE_KEY);
+        if (json) a = JSON.parse(json);
+    } catch (e) { a = {}; }
+
+    // Los parametros de la URL (enlace compartido) tienen prioridad
+    var v_url = leer_ajustes_url();
+    if (v_url) Object.assign(a, v_url);
+
+    if (Object.keys(a).length === 0) return;
 
     // Selects
     if (a.cameraMode) document.getElementById('cameraMode').value = a.cameraMode;
     if (a.worldSelect) document.getElementById('worldSelect').value = a.worldSelect;
     if (a.shapeSelect) document.getElementById('shapeSelect').value = a.shapeSelect;
     if (a.rulesSelect) document.getElementById('rulesSelect').value = a.rulesSelect;
+    if (a.customRule) document.getElementById('customRuleInput').value = a.customRule;
+    if (a.themeSelect) document.getElementById('themeSelect').value = a.themeSelect;
+    if (a.puzzleSelect) document.getElementById('puzzleSelect').value = a.puzzleSelect;
     if (a.gameMode) document.getElementById('gameMode').value = a.gameMode;
 
     // Ranges
@@ -263,6 +421,8 @@ function restaurar_ajustes() {
     // Checkboxes
     if (typeof a.neonToggle === 'boolean') document.getElementById('neonToggle').checked = a.neonToggle;
     if (typeof a.ambientToggle === 'boolean') document.getElementById('ambientToggle').checked = a.ambientToggle;
+    if (typeof a.ageColorToggle === 'boolean') document.getElementById('ageColorToggle').checked = a.ageColorToggle;
+    if (typeof a.audioToggle === 'boolean') document.getElementById('audioToggle').checked = a.audioToggle;
 
     // Sincronizar variables JS con los valores restaurados
     GRID_ROWS = parseInt(document.getElementById('rowsRange').value);
@@ -274,8 +434,16 @@ function restaurar_ajustes() {
     currentCameraMode = document.getElementById('cameraMode').value;
     simulationSpeed = 830 - parseInt(document.getElementById('speedRange').value);
     neonGlowEnabled = document.getElementById('neonToggle').checked;
+    ageColorEnabled = document.getElementById('ageColorToggle').checked;
+    temaActual = document.getElementById('themeSelect').value;
+    desafioActual = parseInt(document.getElementById('puzzleSelect').value) || 0;
     if (!document.getElementById('ambientToggle').checked) {
         document.getElementById('ambient-bg').style.display = 'none';
+    }
+    // Regla personalizada: aplicarla y mostrar su input si estaba seleccionada
+    if (currentRules === 'custom') {
+        aplicar_regla_personalizada();
+        document.getElementById('customRuleInput').style.display = 'block';
     }
 }
 
@@ -307,6 +475,8 @@ animate();
     }
     // Mostrar tooltip de reglas en modo visualizacion al cargar
     updateGameTooltip();
+    // Mostrar mini-tutorial en la primera visita (queda tras la intro)
+    mostrar_tutorial();
 })();
 
 // =====================================================================
@@ -391,6 +561,8 @@ animate();
         setTimeout(function() {
             if (gameMode === 'visualization') gamePaused = false;
         }, 600);
+        // Arrancar el audio ambiental si quedo activado (este gesto lo permite)
+        if (document.getElementById('audioToggle').checked) alternar_audio(true);
     }
     overlay.addEventListener('click', dismissIntro);
     overlay.addEventListener('touchstart', dismissIntro);
@@ -607,16 +779,66 @@ function init() {
     // Reglas del automata celular: cambia las reglas y reinicia
     document.getElementById('rulesSelect').addEventListener('change', (e) => {
         currentRules = e.target.value;
+        // Mostrar el input de regla personalizada solo cuando aplica
+        document.getElementById('customRuleInput').style.display = (currentRules === 'custom') ? 'block' : 'none';
+        if (currentRules === 'custom') aplicar_regla_personalizada();
         resetGame();
         updateGameTooltip();
         guardar_ajustes();
     });
+
+    // Input de regla personalizada (notacion B/S): aplica en vivo y guarda
+    document.getElementById('customRuleInput').addEventListener('input', aplicar_regla_personalizada);
+    document.getElementById('customRuleInput').addEventListener('change', guardar_ajustes);
+
+    // --- Controles de patrones y simulacion (modo visualizacion) ---
+    document.getElementById('stampBtn').addEventListener('click', estampar_patron);
+    document.getElementById('vizPauseBtn').addEventListener('click', () => pausar_simulacion(!gamePaused));
+    document.getElementById('stepBtn').addEventListener('click', paso_simulacion);
+    document.getElementById('rewindBtn').addEventListener('click', rebobinar_simulacion);
+
+    // Toggle coloreado por edad de las celulas
+    document.getElementById('ageColorToggle').addEventListener('change', (e) => {
+        ageColorEnabled = e.target.checked;
+        guardar_ajustes();
+    });
+
+    // Selector de tema de color
+    document.getElementById('themeSelect').addEventListener('change', (e) => {
+        aplicar_tema(e.target.value);
+        guardar_ajustes();
+    });
+
+    // Boton de captura de pantalla (PNG)
+    document.getElementById('screenshotBtn').addEventListener('click', capturar_pantalla);
+
+    // Boton de compartir configuracion (copia URL al portapapeles)
+    document.getElementById('shareBtn').addEventListener('click', compartir_configuracion);
+
+    // Toggle de sonido ambiental
+    document.getElementById('audioToggle').addEventListener('change', (e) => {
+        alternar_audio(e.target.checked);
+        guardar_ajustes();
+    });
+
+    // Cerrar el mini-tutorial
+    document.getElementById('tutorialCloseBtn').addEventListener('click', cerrar_tutorial);
+
+    // Atajos de teclado globales
+    document.addEventListener('keydown', manejar_atajo_teclado);
 
     // --- Controles del modo de juego ---
 
     // Selector de modo de juego
     document.getElementById('gameMode').addEventListener('change', function(e) {
         switchGameMode(e.target.value);
+        guardar_ajustes();
+    });
+
+    // Selector de desafio (modo Puzzle): reinicia la partida con el nuevo reto
+    document.getElementById('puzzleSelect').addEventListener('change', function(e) {
+        desafioActual = parseInt(e.target.value);
+        if (gameMode === 'puzzle') switchGameMode('puzzle');
         guardar_ajustes();
     });
 
@@ -680,7 +902,7 @@ function updateWorldShell() {
     let geo;
     const opacity = document.getElementById('worldOpacity').value;
     const mat = new THREE.MeshStandardMaterial({
-        color: 0x00f2ff,
+        color: obtener_acento(),
         roughness: 0.7,
         metalness: 0.1,
         transparent: true,
@@ -787,7 +1009,7 @@ function startRebootCountdown(statusType) {
     // Show overlay
     overlay.style.display = 'block';
     document.getElementById('timer').innerText = rebootTime;
-    if (worldShell) worldShell.material.color.setHex(statusType === 'extincion' ? 0xff0055 : 0x00f2ff);
+    if (worldShell) worldShell.material.color.setHex(statusType === 'extincion' ? 0xff0055 : obtener_acento());
     rebootInterval = setInterval(function() {
         rebootTime--;
         document.getElementById('timer').innerText = rebootTime;
@@ -809,61 +1031,534 @@ function stopRebootCountdown() {
     if (rebootInterval) {
         clearInterval(rebootInterval); rebootInterval = null;
         document.getElementById('reboot-overlay').style.display = 'none';
-        if (worldShell) worldShell.material.color.setHex(0x00f2ff);
+        if (worldShell) worldShell.material.color.setHex(obtener_acento());
     }
 }
 
 /**
- * updateSimulation — Calcula la siguiente generacion del automata celular
+ * updateSimulation — Solicita el avance de una generacion
  *
- * Recorre todas las celulas del grid, cuenta los vecinos vivos (topologia
- * toroidal) y aplica las reglas B/S seleccionadas para determinar el
- * siguiente estado. Tambien detecta celulas estables (misma posicion en
- * 3 generaciones consecutivas), activa el destello neon en celulas que
- * nacen, y actualiza los contadores de la interfaz. Al final, invoca
- * analyzeStatus() para deteccion de estados y updateGameState() si
- * hay una partida en curso.
+ * Si hay Web Worker disponible, le envia el grid actual y el anterior
+ * (como Int8Array transferibles) y el resultado se aplica de forma
+ * asincrona en aplicar_resultado_paso(). Sin worker, calcula el paso de
+ * forma sincrona en el hilo principal. La funcion pura de calculo vive en
+ * simulacion.js (compartida con el worker).
  */
 function updateSimulation() {
-    let nextGrid = [];
-    let totalAlive = 0, stableCount = 0;
+    if (workerBusy) return;    // el worker aun procesa el paso anterior
+    guardar_estado_rewind();   // registrar el grid actual para poder rebobinar
+
+    if (simWorker) {
+        workerBusy = true;
+        var v_grid_t = Int8Array.from(grid);
+        var v_prev_t = Int8Array.from(prevGrid);
+        simWorker.postMessage(
+            { grid: v_grid_t, prevGrid: v_prev_t, filas: GRID_ROWS, columnas: GRID_COLS, regla: rules[currentRules] },
+            [v_grid_t.buffer, v_prev_t.buffer]
+        );
+    } else {
+        // Fallback sincrono (sin worker)
+        var r = calcular_siguiente_generacion(grid, prevGrid, GRID_ROWS, GRID_COLS, rules[currentRules]);
+        aplicar_resultado_paso(r.v_next_grid, r.v_pattern_map, r.v_celulas_nacidas, r.v_total_vivas, r.v_total_estables);
+    }
+}
+
+/**
+ * aplicar_resultado_paso — Vuelca el resultado de un paso al estado e interfaz
+ *
+ * Comun al flujo con worker (onmessage) y al sincrono (fallback). Actualiza
+ * patternMap, destellos, edad de celulas, grid/prevGrid y contadores, y
+ * dispara analyzeStatus() y updateGameState() si hay partida en curso.
+ *
+ * @param {number[]|Int8Array} v_next_grid
+ * @param {number[]|Int8Array} v_pattern_map
+ * @param {number[]} v_nacidas — indices de celulas recien nacidas
+ * @param {number} v_vivas
+ * @param {number} v_estables
+ */
+function aplicar_resultado_paso(v_next_grid, v_pattern_map, v_nacidas, v_vivas, v_estables) {
+    patternMap = v_pattern_map;
+    // Activar destello neon en las celulas recien nacidas
+    for (const v_idx of v_nacidas) {
+        glowIntensity[v_idx] = 1.0;
+    }
+    // Actualizar la edad de cada celula (usa el grid actual, aun sin sobrescribir):
+    // sigue viva -> +1 generacion; nace -> 1; muere -> 0
     for (let i = 0; i < GRID_TOTAL; i++) {
-        const x = Math.floor(i / GRID_COLS);  // fila
-        const z = i % GRID_COLS;              // columna
-        let neighbors = 0;
-        for(let ix=-1; ix<=1; ix++) {
-            for(let iz=-1; iz<=1; iz++) {
-                if(ix===0 && iz===0) continue;
-                const nx = (x + ix + GRID_ROWS) % GRID_ROWS;
-                const nz = (z + iz + GRID_COLS) % GRID_COLS;
-                neighbors += grid[nx * GRID_COLS + nz];
-            }
-        }
-        const isAlive = grid[i] === 1;
-        const rule = rules[currentRules];
-        if (isAlive) {
-            nextGrid[i] = rule.survival.includes(neighbors) ? 1 : 0;
+        if (v_next_grid[i] === 1) {
+            cellAge[i] = grid[i] === 1 ? (cellAge[i] || 0) + 1 : 1;
         } else {
-            nextGrid[i] = rule.birth.includes(neighbors) ? 1 : 0;
+            cellAge[i] = 0;
         }
-        if (nextGrid[i] === 1 && nextGrid[i] === grid[i] && grid[i] === prevGrid[i]) {
-            patternMap[i] = 1; stableCount++;
-        } else { patternMap[i] = 0; }
-        // Activar destello neon en celulas que nacen
-        if (nextGrid[i] === 1 && grid[i] === 0) {
-            glowIntensity[i] = 1.0;
-        }
-        if (nextGrid[i] === 1) totalAlive++;
     }
-    prevGrid = [...grid]; grid = [...nextGrid];
+    prevGrid = [...grid];
+    // El worker devuelve Int8Array; normalizar a array plano para el resto del codigo
+    grid = (v_next_grid instanceof Int8Array) ? Array.from(v_next_grid) : v_next_grid;
     generationCount++;
+
     document.getElementById('genCount').innerText = generationCount;
-    document.getElementById('popCount').innerText = totalAlive;
-    document.getElementById('patternCount').innerText = stableCount;
-    analyzeStatus(totalAlive);
+    document.getElementById('popCount').innerText = v_vivas;
+    document.getElementById('patternCount').innerText = v_estables;
+    analyzeStatus(v_vivas);
     if (gamePhase === 'running') {
-        updateGameState(totalAlive, stableCount);
+        updateGameState(v_vivas, v_estables);
     }
+}
+
+// =====================================================================
+// CONTROLES DE SIMULACION (pausa / paso a paso / rebobinado)
+// =====================================================================
+
+/**
+ * pausar_simulacion — Pausa o reanuda la simulacion y sincroniza el boton
+ *
+ * @param {boolean} v_pausar — true para pausar, false para reanudar
+ */
+function pausar_simulacion(v_pausar) {
+    gamePaused = v_pausar;
+    const v_btn = document.getElementById('vizPauseBtn');
+    if (v_btn) v_btn.innerText = v_pausar ? '▶' : '⏸';
+}
+
+/**
+ * guardar_estado_rewind — Guarda una copia del grid actual en el buffer
+ *
+ * Se invoca antes de cada paso de simulacion. Mantiene como maximo
+ * REWIND_MAX estados para acotar el consumo de memoria.
+ */
+function guardar_estado_rewind() {
+    rewindBuffer.push(grid.slice());
+    if (rewindBuffer.length > REWIND_MAX) rewindBuffer.shift();
+}
+
+/**
+ * paso_simulacion — Avanza exactamente una generacion con la simulacion pausada
+ */
+function paso_simulacion() {
+    pausar_simulacion(true);
+    updateSimulation();
+}
+
+/**
+ * rebobinar_simulacion — Retrocede a la generacion anterior del buffer
+ *
+ * Restaura el ultimo grid guardado. No reconstruye el historial completo
+ * (popHistory/prevGrid), suficiente para inspeccion visual paso a paso.
+ */
+function rebobinar_simulacion() {
+    if (rewindBuffer.length === 0) return;
+    invalidar_paso_worker();
+    pausar_simulacion(true);
+    grid = rewindBuffer.pop();
+    for (let i = 0; i < GRID_TOTAL; i++) {
+        patternMap[i] = 0;
+        visualScales[i] = grid[i] ? 1.0 : 0;
+    }
+    if (generationCount > 0) generationCount--;
+    document.getElementById('genCount').innerText = generationCount;
+}
+
+/**
+ * estampar_patron — Coloca el patron seleccionado, centrado, en un grid vacio
+ *
+ * Pausa la simulacion, limpia el grid y escribe el patron elegido del
+ * selector centrandolo segun su bounding box. Pensado para estudiar
+ * patrones clasicos de forma aislada.
+ */
+function estampar_patron() {
+    const v_nombre = document.getElementById('patternSelect').value;
+    const v_celulas = patrones[v_nombre];
+    if (!v_celulas) return;
+
+    invalidar_paso_worker();
+    pausar_simulacion(true);
+    // Limpiar el grid para estudiar el patron aislado
+    for (let i = 0; i < GRID_TOTAL; i++) {
+        grid[i] = 0; prevGrid[i] = 0; patternMap[i] = 0;
+        glowIntensity[i] = 0; visualScales[i] = 0; cellAge[i] = 0;
+    }
+
+    // Calcular el tamaño del patron para centrarlo
+    let v_max_fila = 0, v_max_col = 0;
+    for (const v_par of v_celulas) {
+        if (v_par[0] > v_max_fila) v_max_fila = v_par[0];
+        if (v_par[1] > v_max_col) v_max_col = v_par[1];
+    }
+    const v_off_fila = Math.max(0, Math.floor((GRID_ROWS - v_max_fila) / 2));
+    const v_off_col = Math.max(0, Math.floor((GRID_COLS - v_max_col) / 2));
+
+    for (const v_par of v_celulas) {
+        const v_fila = v_off_fila + v_par[0];
+        const v_col = v_off_col + v_par[1];
+        if (v_fila >= 0 && v_fila < GRID_ROWS && v_col >= 0 && v_col < GRID_COLS) {
+            const v_idx = v_fila * GRID_COLS + v_col;
+            grid[v_idx] = 1;
+            glowIntensity[v_idx] = 1.0;
+            visualScales[v_idx] = 1.0;
+            cellAge[v_idx] = 1;
+        }
+    }
+
+    // Reiniciar contadores y estado
+    generationCount = 0;
+    document.getElementById('genCount').innerText = 0;
+    document.getElementById('popCount').innerText = v_celulas.length;
+    document.getElementById('patternCount').innerText = 0;
+    popHistory = [];
+    rewindBuffer = [];
+    stopRebootCountdown();
+    const v_status = document.getElementById('status-box');
+    v_status.className = ''; v_status.classList.add('status-caos'); v_status.innerText = 'PAUSA';
+}
+
+/**
+ * parsear_regla_bs — Convierte texto en notacion B/S a {birth, survival}
+ *
+ * Acepta formatos como "B3/S23", "b3/s23" o "3/23". Devuelve null si el
+ * formato no es valido.
+ *
+ * @param {string} v_texto — cadena con la regla
+ * @returns {{birth:number[], survival:number[]}|null}
+ */
+function parsear_regla_bs(v_texto) {
+    if (!v_texto) return null;
+    const v_limpio = v_texto.toUpperCase().replace(/\s+/g, '');
+    const v_match = v_limpio.match(/^B?([0-8]*)\/S?([0-8]*)$/);
+    if (!v_match) return null;
+    return {
+        birth: v_match[1].split('').map(Number),
+        survival: v_match[2].split('').map(Number)
+    };
+}
+
+/**
+ * aplicar_regla_personalizada — Lee el input de texto y actualiza rules.custom
+ *
+ * Si el formato es valido, sustituye la regla custom; si no, marca el input
+ * en rojo y mantiene la regla anterior.
+ */
+function aplicar_regla_personalizada() {
+    const v_input = document.getElementById('customRuleInput');
+    const v_regla = parsear_regla_bs(v_input.value);
+    if (v_regla) {
+        rules.custom = v_regla;
+        v_input.style.borderColor = '#333';
+    } else {
+        v_input.style.borderColor = '#ff0055';
+    }
+}
+
+/**
+ * aplicar_tema — Cambia el tema de color activo y refresca la escena
+ *
+ * Actualiza el color del mundo y de la malla de referencia al instante.
+ * El color de las celulas se aplica en el siguiente frame de animate().
+ *
+ * @param {string} v_tema — clave del tema en el objeto temas
+ */
+function aplicar_tema(v_tema) {
+    if (!temas[v_tema]) return;
+    temaActual = v_tema;
+    if (worldShell) worldShell.material.color.setHex(obtener_acento());
+    if (gridHelper) gridHelper.material.color.setHex(obtener_acento());
+}
+
+/**
+ * capturar_pantalla — Exporta el frame actual como imagen PNG descargable
+ *
+ * Fuerza un render del compositor y lee el canvas en el mismo tick (sin
+ * preserveDrawingBuffer, para no penalizar el rendimiento). Genera un
+ * enlace de descarga temporal con el PNG resultante.
+ */
+function capturar_pantalla() {
+    composer.render();
+    const v_url = renderer.domElement.toDataURL('image/png');
+    const v_enlace = document.createElement('a');
+    v_enlace.href = v_url;
+    v_enlace.download = 'tronway-' + Date.now() + '.png';
+    v_enlace.click();
+}
+
+// =====================================================================
+// RECORDS LOCALES (localStorage)
+// =====================================================================
+// Las mejores puntuaciones de Supervivencia y Conquista se guardan como
+// un unico objeto JSON bajo la clave SCORES_KEY (definida arriba).
+
+/**
+ * cargar_records — Devuelve el objeto de records guardado (o {} si no hay)
+ */
+function cargar_records() {
+    try { return JSON.parse(localStorage.getItem(SCORES_KEY)) || {}; }
+    catch (e) { return {}; }
+}
+
+/**
+ * obtener_record — Mejor puntuacion guardada para un modo
+ * @param {string} v_modo — 'survival' o 'conquest'
+ * @returns {number}
+ */
+function obtener_record(v_modo) {
+    return cargar_records()[v_modo] || 0;
+}
+
+/**
+ * registrar_record — Guarda la puntuacion si supera el record del modo
+ * @returns {boolean} true si se ha batido el record
+ */
+function registrar_record(v_modo, v_puntos) {
+    const v_records = cargar_records();
+    if (v_puntos > (v_records[v_modo] || 0)) {
+        v_records[v_modo] = v_puntos;
+        try { localStorage.setItem(SCORES_KEY, JSON.stringify(v_records)); } catch (e) { /* ignorar */ }
+        return true;
+    }
+    return false;
+}
+
+/**
+ * formato_objetivo — Texto corto del objetivo de un desafio (para la UI)
+ */
+function formato_objetivo(v_objetivo) {
+    if (v_objetivo.tipo === 'poblacion') return '≥' + v_objetivo.valor + ' pob';
+    if (v_objetivo.tipo === 'supervivencia') return '≥' + v_objetivo.valor + ' gen';
+    if (v_objetivo.tipo === 'puntos') return '≥' + v_objetivo.valor + ' pts';
+    return '-';
+}
+
+// =====================================================================
+// COMPARTIR CONFIGURACION POR URL
+// =====================================================================
+// (AJUSTES_STR y AJUSTES_BOOL definidas arriba: claves de control que se
+// serializan tanto en localStorage como en la URL compartible.)
+
+/**
+ * leer_ajustes_url — Lee los ajustes de los parametros de la URL
+ *
+ * @returns {object|null} objeto de ajustes, o null si la URL no trae ninguno
+ */
+function leer_ajustes_url() {
+    var v_params = new URLSearchParams(window.location.search);
+    if (![...v_params].length) return null;
+    var a = {};
+    AJUSTES_STR.forEach(function(k) { if (v_params.has(k)) a[k] = v_params.get(k); });
+    AJUSTES_BOOL.forEach(function(k) { if (v_params.has(k)) a[k] = v_params.get(k) === '1'; });
+    return a;
+}
+
+/**
+ * construir_url_compartir — Construye una URL con los ajustes actuales
+ *
+ * @returns {string} URL absoluta con los ajustes en el querystring
+ */
+function construir_url_compartir() {
+    var v_params = new URLSearchParams();
+    AJUSTES_STR.forEach(function(k) { v_params.set(k, document.getElementById(k === 'customRule' ? 'customRuleInput' : k).value); });
+    AJUSTES_BOOL.forEach(function(k) { v_params.set(k, document.getElementById(k).checked ? '1' : '0'); });
+    return window.location.origin + window.location.pathname + '?' + v_params.toString();
+}
+
+/**
+ * compartir_configuracion — Copia al portapapeles la URL con los ajustes
+ *
+ * Da feedback temporal en el propio boton.
+ */
+function compartir_configuracion() {
+    var v_url = construir_url_compartir();
+    var v_btn = document.getElementById('shareBtn');
+    var v_texto = v_btn.innerText;
+    function feedback(msg) {
+        v_btn.innerText = msg;
+        setTimeout(function() { v_btn.innerText = v_texto; }, 1500);
+    }
+    // Fallback: si el portapapeles no esta disponible, mostrar la URL para copiar a mano
+    function copiar_manual() {
+        window.prompt('Copia este enlace para compartir tu configuración:', v_url);
+        feedback('🔗 ENLACE LISTO');
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(v_url).then(
+            function() { feedback('✓ COPIADO'); },
+            function() { copiar_manual(); }
+        );
+    } else {
+        copiar_manual();
+    }
+}
+
+// =====================================================================
+// AUDIO AMBIENTE (Web Audio API, sintetico)
+// =====================================================================
+// Pad ambiental grave generado con osciladores; sin assets externos.
+// El AudioContext se crea bajo demanda tras un gesto del usuario.
+let audioCtx = null;       // contexto de audio (lazy)
+let audioMaster = null;    // ganancia maestra
+let audioEnabled = false;  // estado del sonido
+
+/**
+ * iniciar_audio — Crea el grafo de audio ambiental (una sola vez)
+ */
+function iniciar_audio() {
+    if (audioCtx) return;
+    var Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    audioCtx = new Ctx();
+    audioMaster = audioCtx.createGain();
+    audioMaster.gain.value = 0;
+    audioMaster.connect(audioCtx.destination);
+    // Filtro paso-bajo comun para el pad
+    var v_filtro = audioCtx.createBiquadFilter();
+    v_filtro.type = 'lowpass';
+    v_filtro.frequency.value = 600;
+    v_filtro.connect(audioMaster);
+    // Dos osciladores graves detunados (acorde de quinta)
+    [55, 82.5].forEach(function(v_freq) {
+        var v_osc = audioCtx.createOscillator();
+        v_osc.type = 'sawtooth';
+        v_osc.frequency.value = v_freq;
+        var v_g = audioCtx.createGain();
+        v_g.gain.value = 0.15;
+        v_osc.connect(v_g); v_g.connect(v_filtro);
+        v_osc.start();
+    });
+    // LFO lento que modula el filtro para dar movimiento al pad
+    var v_lfo = audioCtx.createOscillator();
+    v_lfo.frequency.value = 0.07;
+    var v_lfo_g = audioCtx.createGain();
+    v_lfo_g.gain.value = 300;
+    v_lfo.connect(v_lfo_g); v_lfo_g.connect(v_filtro.frequency);
+    v_lfo.start();
+}
+
+/**
+ * alternar_audio — Activa o desactiva el sonido ambiental con fundido
+ *
+ * @param {boolean} v_on
+ */
+function alternar_audio(v_on) {
+    audioEnabled = v_on;
+    if (v_on) {
+        iniciar_audio();
+        if (!audioCtx) return;
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        audioMaster.gain.cancelScheduledValues(audioCtx.currentTime);
+        audioMaster.gain.linearRampToValueAtTime(0.18, audioCtx.currentTime + 1.5);
+    } else if (audioCtx) {
+        audioMaster.gain.cancelScheduledValues(audioCtx.currentTime);
+        audioMaster.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.8);
+    }
+}
+
+/**
+ * sonido_evento — Reproduce un efecto corto (victoria / derrota / reboot)
+ *
+ * @param {string} v_tipo — 'win' | 'lose' | 'reboot'
+ */
+function sonido_evento(v_tipo) {
+    if (!audioEnabled || !audioCtx) return;
+    var t = audioCtx.currentTime;
+    var v_osc = audioCtx.createOscillator();
+    var v_g = audioCtx.createGain();
+    v_osc.type = 'triangle';
+    v_osc.connect(v_g); v_g.connect(audioMaster);
+    v_g.gain.setValueAtTime(0.0001, t);
+    v_g.gain.exponentialRampToValueAtTime(0.3, t + 0.02);
+    v_g.gain.exponentialRampToValueAtTime(0.0001, t + 0.5);
+    if (v_tipo === 'win') {
+        v_osc.frequency.setValueAtTime(440, t);
+        v_osc.frequency.exponentialRampToValueAtTime(880, t + 0.4);
+    } else if (v_tipo === 'lose') {
+        v_osc.frequency.setValueAtTime(330, t);
+        v_osc.frequency.exponentialRampToValueAtTime(110, t + 0.4);
+    } else {
+        v_osc.frequency.setValueAtTime(220, t);
+    }
+    v_osc.start(t); v_osc.stop(t + 0.5);
+}
+
+// =====================================================================
+// ATAJOS DE TECLADO
+// =====================================================================
+
+/**
+ * alternar_pausa — Pausa/reanuda segun el modo (visualizacion o juego)
+ */
+function alternar_pausa() {
+    if (gameMode === 'visualization') {
+        pausar_simulacion(!gamePaused);
+    } else if (gamePhase === 'running' || gamePhase === 'placing') {
+        gamePaused = !gamePaused;
+        document.getElementById('pauseBtn').innerText = gamePaused ? '▶ REANUDAR' : '⏸ PAUSA';
+    }
+}
+
+/**
+ * manejar_atajo_teclado — Atajos globales de teclado
+ *
+ * Se ignora cuando el foco esta en un campo de texto. Atajos:
+ *   Espacio = pausa/reanuda   S = paso (solo visualizacion)
+ *   R = reiniciar/reintentar  ←/→ = velocidad -/+
+ *   C = captura PNG           N = toggle neon
+ */
+function manejar_atajo_teclado(e) {
+    var v_tag = (e.target.tagName || '').toLowerCase();
+    if (v_tag === 'input' || v_tag === 'select' || v_tag === 'textarea') return;
+
+    switch (e.code) {
+        case 'Space':
+            e.preventDefault();
+            alternar_pausa();
+            break;
+        case 'KeyS':
+            if (gameMode === 'visualization') paso_simulacion();
+            break;
+        case 'KeyR':
+            document.getElementById('resetBtn').click();
+            break;
+        case 'KeyC':
+            capturar_pantalla();
+            break;
+        case 'KeyN':
+            var v_neon = document.getElementById('neonToggle');
+            if (!v_neon.disabled) { v_neon.checked = !v_neon.checked; v_neon.dispatchEvent(new Event('change')); }
+            break;
+        case 'ArrowLeft':
+        case 'ArrowRight':
+            e.preventDefault();
+            var v_speed = document.getElementById('speedRange');
+            var v_paso = parseInt(v_speed.step) || 10;
+            var v_delta = (e.code === 'ArrowRight' ? 1 : -1) * v_paso * 5;
+            v_speed.value = Math.max(parseInt(v_speed.min), Math.min(parseInt(v_speed.max), parseInt(v_speed.value) + v_delta));
+            v_speed.dispatchEvent(new Event('input'));
+            break;
+    }
+}
+
+// =====================================================================
+// MINI-TUTORIAL (primera visita)
+// =====================================================================
+// (TUTORIAL_KEY definida arriba, junto al resto de claves de localStorage.)
+
+/**
+ * mostrar_tutorial — Muestra el tutorial si es la primera visita
+ *
+ * Detras de la intro (z-index menor); queda visible al cerrar la intro.
+ */
+function mostrar_tutorial() {
+    var v_visto;
+    try { v_visto = localStorage.getItem(TUTORIAL_KEY); } catch (e) { v_visto = '1'; }
+    if (v_visto) return;
+    document.getElementById('tutorial-overlay').style.display = 'flex';
+}
+
+/**
+ * cerrar_tutorial — Oculta el tutorial y marca como visto
+ */
+function cerrar_tutorial() {
+    var v_overlay = document.getElementById('tutorial-overlay');
+    v_overlay.style.opacity = '0';
+    setTimeout(function() { v_overlay.style.display = 'none'; }, 400);
+    try { localStorage.setItem(TUTORIAL_KEY, '1'); } catch (e) { /* ignorar */ }
 }
 
 /**
@@ -955,6 +1650,9 @@ function analyzeStatus(currentPop) {
     popHistory.push(currentPop);
     if (popHistory.length > 40) popHistory.shift();
     if (gameMode !== 'visualization') return;
+    // Si la simulacion esta pausada manualmente (paso a paso, rebobinado,
+    // estampado de patrones), no disparar el reinicio automatico.
+    if (gamePaused) return;
     const statusBox = document.getElementById('status-box');
     statusBox.className = "";
     if (currentPop === 0) {
@@ -989,7 +1687,7 @@ function analyzeStatus(currentPop) {
  */
 function animate(time) {
     requestAnimationFrame(animate);
-    if (!gamePaused && time - lastStepTime > simulationSpeed) { updateSimulation(); lastStepTime = time; }
+    if (!gamePaused && !workerBusy && time - lastStepTime > simulationSpeed) { updateSimulation(); lastStepTime = time; }
     const color = new THREE.Color();
 
     for (let i = 0; i < GRID_TOTAL; i++) {
@@ -1041,10 +1739,15 @@ function animate(time) {
             if (currentShape === 'donut') dummy.rotation.x += time * 0.001;
 
             // Color base
-            if (isStable) {
-                color.setRGB(2.5, 0.6, 0.0);
+            if (ageColorEnabled) {
+                // Mapa de calor por edad: joven (cyan) -> veterana (rojo)
+                const v_edad_norm = Math.min((cellAge[i] || 0) / 30, 1);
+                color.setHSL(0.5 - v_edad_norm * 0.5, 1.0, 0.5);
+            } else if (isStable) {
+                const v_est = temas[temaActual].estable;
+                color.setRGB(v_est[0], v_est[1], v_est[2]);
             } else {
-                color.setHSL(0.5 + (row / GRID_ROWS) * 0.1, 1.0, 0.5);
+                color.setHSL(temas[temaActual].hueBase + (row / GRID_ROWS) * 0.1, 1.0, 0.5);
             }
 
             // Efecto neón: valores ligeramente >1 activan el halo del bloom
@@ -1136,6 +1839,7 @@ function fitCameraToWorld() {
  * la camara desde la posicion actual.
  */
 function resizeGrid() {
+    invalidar_paso_worker();
     generationCount = 0;
     document.getElementById('genCount').innerText = 0;
     GRID_TOTAL = GRID_ROWS * GRID_COLS;
@@ -1206,7 +1910,7 @@ function createGridHelper() {
     }
     var geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    var mat = new THREE.LineBasicMaterial({ color: 0x00f2ff, transparent: true, opacity: 0.12 });
+    var mat = new THREE.LineBasicMaterial({ color: obtener_acento(), transparent: true, opacity: 0.12 });
     gridHelper = new THREE.LineSegments(geo, mat);
     gridHelper.visible = false;
     scene.add(gridHelper);
@@ -1304,6 +2008,7 @@ function onGridClick(event) {
  * @param {string} mode — 'visualization', 'survival' o 'conquest'
  */
 function switchGameMode(mode) {
+    invalidar_paso_worker();
     gameMode = mode;
     var panel = document.getElementById('ui-panel');
     gamePaused = false;
@@ -1338,6 +2043,7 @@ function switchGameMode(mode) {
 
     if (mode === 'visualization') {
         panel.classList.remove('game-active');
+        panel.classList.remove('puzzle-active');
         showGridHelper(false);
         document.getElementById('resetBtn').innerText = 'REINICIAR MUNDO';
         updateGameTooltip();
@@ -1346,7 +2052,7 @@ function switchGameMode(mode) {
         currentRules = document.getElementById('rulesSelect').value;
         updateWorldShell();
         fitCameraToWorld();
-        if (worldShell) worldShell.material.color.setHex(0x00f2ff);
+        if (worldShell) worldShell.material.color.setHex(obtener_acento());
         // Poblar grid aleatorio
         for (var i = 0; i < GRID_TOTAL; i++) {
             grid[i] = Math.random() > 0.85 ? 1 : 0;
@@ -1355,11 +2061,17 @@ function switchGameMode(mode) {
         }
     } else {
         panel.classList.add('game-active');
-        // Forzar mundo plano y Conway para modos de juego
+        panel.classList.toggle('puzzle-active', mode === 'puzzle');
+        // Modos de juego siempre en mundo plano
         currentWorld = 'plane';
-        currentRules = 'conway';
         document.getElementById('worldSelect').value = 'plane';
-        document.getElementById('rulesSelect').value = 'conway';
+        // Las reglas las fija el desafio en Puzzle; Conway en el resto
+        if (mode === 'puzzle') {
+            currentRules = desafios[desafioActual].reglas;
+        } else {
+            currentRules = 'conway';
+        }
+        document.getElementById('rulesSelect').value = currentRules;
         updateWorldShell();
         fitCameraToWorld();
         // Valores por defecto segun modo
@@ -1392,6 +2104,7 @@ function switchGameMode(mode) {
  * @param {string} mode — 'survival' o 'conquest'
  */
 function startGame(mode) {
+    invalidar_paso_worker();
     for (var i = 0; i < GRID_TOTAL; i++) {
         grid[i] = 0;
         prevGrid[i] = 0;
@@ -1419,6 +2132,12 @@ function startGame(mode) {
     } else if (mode === 'conquest') {
         cellBudget = uiBudget;
         gameGenLimit = uiGenLimit;
+    } else if (mode === 'puzzle') {
+        // El presupuesto y las reglas los fija el desafio, no los sliders
+        var d = desafios[desafioActual];
+        cellBudget = d.budget;
+        gameGenLimit = 0;
+        currentRules = d.reglas;
     }
 
     gamePhase = 'placing';
@@ -1471,17 +2190,33 @@ function runGame() {
 function updateGameState(alive, stable) {
     if (gameMode === 'survival') {
         gameScore += alive > 0 ? 1 : 0;
-    } else if (gameMode === 'conquest') {
-        gameScore += alive;
+    } else if (gameMode === 'conquest' || gameMode === 'puzzle') {
+        gameScore += alive;   // acumular poblacion total
+    }
+
+    // Puzzle: comprobar victoria ANTES que las condiciones de fin (derrota)
+    if (gameMode === 'puzzle') {
+        var d = desafios[desafioActual];
+        var v_logrado = false;
+        if (d.objetivo.tipo === 'poblacion') v_logrado = alive >= d.objetivo.valor;
+        else if (d.objetivo.tipo === 'supervivencia') v_logrado = generationCount >= d.objetivo.valor;
+        else if (d.objetivo.tipo === 'puntos') v_logrado = gameScore >= d.objetivo.valor;
+        if (v_logrado) {
+            endGame('★ DESAFÍO SUPERADO');
+            return;
+        }
     }
 
     // Condiciones de fin
     var ended = false;
     var result = '';
 
+    // En Puzzle, llegar a extincion o estabilidad es una derrota
+    var v_es_puzzle = gameMode === 'puzzle';
+
     if (alive === 0) {
         ended = true;
-        result = 'EXTINCIÓN';
+        result = v_es_puzzle ? 'DESAFÍO FALLIDO' : 'EXTINCIÓN';
     } else if (gameGenLimit > 0 && generationCount >= gameGenLimit) {
         ended = true;
         result = 'FIN - ' + gameScore + ' PTS';
@@ -1489,7 +2224,7 @@ function updateGameState(alive, stable) {
         var range = Math.max.apply(null, popHistory) - Math.min.apply(null, popHistory);
         if (range < 5) {
             ended = true;
-            result = 'ESTABLE - ' + gameScore + ' PTS';
+            result = v_es_puzzle ? 'DESAFÍO FALLIDO' : 'ESTABLE - ' + gameScore + ' PTS';
         }
     }
 
@@ -1513,10 +2248,21 @@ function endGame(result) {
     gamePaused = true;
     showGridHelper(true);
     document.getElementById('resetBtn').innerText = '↻ REINTENTAR';
+
+    // Registrar record en modos con puntuacion acumulada
+    var v_es_record = false;
+    if (gameMode === 'survival' || gameMode === 'conquest') {
+        v_es_record = registrar_record(gameMode, gameScore);
+    }
+
+    var v_texto_final = v_es_record ? '★ RÉCORD: ' + gameScore : result;
     var statusBox = document.getElementById('status-box');
     statusBox.className = '';
     statusBox.classList.add('status-estable');
-    statusBox.innerText = result;
+    statusBox.innerText = v_texto_final;
+    // Sonido: victoria si el resultado es destacado (record o desafio superado)
+    sonido_evento(v_texto_final.charAt(0) === '★' ? 'win' : 'lose');
+    updateGameUI();
     stopRebootCountdown();
 }
 
@@ -1530,13 +2276,19 @@ function endGame(result) {
 function updateGameUI() {
     document.getElementById('cellsRemaining').innerText = cellBudget;
     document.getElementById('gameScore').innerText = gameScore;
+    var v_record = '-';
     if (gameMode === 'survival') {
         document.getElementById('gameTarget').innerText = '∞';
+        v_record = obtener_record('survival');
     } else if (gameMode === 'conquest') {
         document.getElementById('gameTarget').innerText = gameGenLimit > 0 ? gameGenLimit + ' gen' : '∞';
+        v_record = obtener_record('conquest');
+    } else if (gameMode === 'puzzle') {
+        document.getElementById('gameTarget').innerText = formato_objetivo(desafios[desafioActual].objetivo);
     } else {
         document.getElementById('gameTarget').innerText = '-';
     }
+    document.getElementById('gameBest').innerText = v_record;
     updateGameTooltip();
 }
 
@@ -1575,6 +2327,11 @@ function updateGameTooltip() {
             placing: '<strong>Conquista</strong> &mdash; Coloca hasta <strong>' + cellBudget + '</strong> células estratégicamente. Pulsa <strong>JUGAR</strong>. Tu objetivo: acumular la mayor población total durante ' + genTxt + '. Cada célula viva por generación suma puntos.',
             running: '<strong>Conquista</strong> &mdash; Cada célula viva suma puntos por generación. Expansión = más puntos. ' + (gameGenLimit > 0 ? 'Termina en la generación ' + gameGenLimit + '.' : 'Sin límite, termina al estabilizarse o extinguirse.'),
             result: '<strong>Conquista</strong> &mdash; Partida terminada. Pulsa <strong>REINTENTAR</strong> para volver a intentarlo o cambia de modo.'
+        },
+        puzzle: {
+            placing: '<strong>' + desafios[desafioActual].nombre + '</strong> &mdash; ' + desafios[desafioActual].descripcion + ' Coloca tus <strong>' + cellBudget + '</strong> células y pulsa <strong>JUGAR</strong>.',
+            running: '<strong>' + desafios[desafioActual].nombre + '</strong> &mdash; ' + desafios[desafioActual].descripcion + ' Si te extingues o estabilizas antes, el desafío falla.',
+            result: '<strong>' + desafios[desafioActual].nombre + '</strong> &mdash; Desafío terminado. Pulsa <strong>REINTENTAR</strong> o elige otro desafío.'
         }
     };
     if (gameMode === 'visualization') {
@@ -1607,6 +2364,7 @@ function updateGameTooltip() {
  * REINICIAR como tras la cuenta atras de reboot automatico.
  */
 function resetGame() {
+    invalidar_paso_worker();
     generationCount = 0;
     document.getElementById('genCount').innerText = 0;
     popHistory = []; stopRebootCountdown();
@@ -1616,7 +2374,7 @@ function resetGame() {
     if (currentCameraMode === 'cinematic') {
         initCinematicCamera();
     }
-    if(worldShell) worldShell.material.color.setHex(0x00f2ff);
+    if(worldShell) worldShell.material.color.setHex(obtener_acento());
     for (let i = 0; i < GRID_TOTAL; i++) {
         grid[i] = Math.random() > 0.85 ? 1 : 0;
         visualScales[i] = grid[i] ? 1.0 : 0;

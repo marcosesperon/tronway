@@ -43,6 +43,21 @@
         <div id="intro-hint">Click para entrar</div>
     </div>
 
+    <div id="tutorial-overlay">
+        <div id="tutorial-card">
+            <h2>BIENVENIDO A TRONWAY</h2>
+            <p>Visualización 3D del Juego de la Vida de Conway.</p>
+            <ul>
+                <li><strong>Arrastra</strong> para rotar · <strong>rueda</strong> para zoom</li>
+                <li>Abre el panel <strong>☰</strong> para cambiar mundo, reglas, geometría y tema</li>
+                <li>Estampa <strong>patrones</strong> clásicos y avanza <strong>paso a paso</strong></li>
+                <li>Prueba los modos <strong>Supervivencia</strong>, <strong>Conquista</strong> y <strong>Puzzle</strong></li>
+                <li>Atajos: <strong>Espacio</strong> pausa · <strong>S</strong> paso · <strong>R</strong> reinicia · <strong>←/→</strong> velocidad · <strong>C</strong> captura · <strong>N</strong> neón</li>
+            </ul>
+            <button id="tutorialCloseBtn">ENTENDIDO</button>
+        </div>
+    </div>
+
     <div id="reboot-overlay">
         <div id="reboot-content">
             <div id="reboot-status"></div>
@@ -83,8 +98,21 @@
                 <option value="visualization" selected>Visualización</option>
                 <option value="survival">Supervivencia</option>
                 <option value="conquest">Conquista</option>
+                <option value="puzzle">Puzzle / Desafíos</option>
             </select>
             <div style="margin-bottom: 8px;"></div>
+
+            <div class="puzzle-only">
+            <span class="label">DESAFÍO</span>
+            <select id="puzzleSelect">
+                <option value="0">Explosión</option>
+                <option value="1">Minimalista</option>
+                <option value="2">Resistencia</option>
+                <option value="3">Replicante</option>
+                <option value="4">Maratón</option>
+            </select>
+            <div style="margin-bottom: 8px;"></div>
+            </div>
 
             <span class="label">MOVIMIENTO CÁMARA</span>
             <select id="cameraMode">
@@ -117,6 +145,15 @@
             </select>
             <div style="margin-bottom: 8px;"></div>
 
+            <span class="label">TEMA DE COLOR</span>
+            <select id="themeSelect">
+                <option value="tron" selected>TRON (cyan)</option>
+                <option value="ambar">Ámbar</option>
+                <option value="magenta">Magenta</option>
+                <option value="fosforo">Fósforo (verde)</option>
+            </select>
+            <div style="margin-bottom: 8px;"></div>
+
             <div class="control-row">
                 <span class="label" style="margin-bottom: 0;">EFECTO NEÓN</span>
                 <label class="switch">
@@ -128,6 +165,20 @@
                 <span class="label" style="margin-bottom: 0;">FONDO AMBIENTE</span>
                 <label class="switch">
                     <input type="checkbox" id="ambientToggle" checked>
+                    <span class="slider"></span>
+                </label>
+            </div>
+            <div class="control-row">
+                <span class="label" style="margin-bottom: 0;">COLOR POR EDAD</span>
+                <label class="switch">
+                    <input type="checkbox" id="ageColorToggle">
+                    <span class="slider"></span>
+                </label>
+            </div>
+            <div class="control-row">
+                <span class="label" style="margin-bottom: 0;">SONIDO</span>
+                <label class="switch">
+                    <input type="checkbox" id="audioToggle">
                     <span class="slider"></span>
                 </label>
             </div>
@@ -146,7 +197,22 @@
                 <option value="anneal">Anneal (B4678/S35678)</option>
                 <option value="replicator">Replicator (B1357/S1357)</option>
                 <option value="maze">Maze (B3/S12345)</option>
+                <option value="custom">Personalizado (B/S)</option>
             </select>
+            <input type="text" id="customRuleInput" placeholder="ej. B3/S23" style="display: none; margin-top: 4px;">
+            <div style="margin-bottom: 8px;"></div>
+
+            <span class="label">PATRÓN</span>
+            <select id="patternSelect">
+                <option value="glider">Glider</option>
+                <option value="lwss">Nave ligera (LWSS)</option>
+                <option value="blinker">Blinker</option>
+                <option value="beacon">Faro</option>
+                <option value="block">Bloque</option>
+                <option value="pulsar">Pulsar</option>
+                <option value="gun">Cañón de Gosper</option>
+            </select>
+            <button id="stampBtn">ESTAMPAR PATRÓN</button>
             <div style="margin-bottom: 8px;"></div>
             </div>
 
@@ -158,7 +224,7 @@
 
             <span class="label">VELOCIDAD</span>
             <input type="range" id="speedRange" min="30" max="800" value="680">
-            <div class="game-only" style="margin-bottom: 2px;">
+            <div class="game-only puzzle-hide" style="margin-bottom: 2px;">
             <span class="label">CÉLULAS: <span id="budgetVal">20</span></span>
             <input type="range" id="budgetRange" min="5" max="100" value="20" step="5">
 
@@ -166,8 +232,15 @@
             <input type="range" id="genLimitRange" min="0" max="500" value="100" step="10">
             </div>
 
+            <div class="viz-only btn-row">
+                <button id="vizPauseBtn" title="Pausar / reanudar">⏸</button>
+                <button id="stepBtn" title="Avanzar una generación">▶|</button>
+                <button id="rewindBtn" title="Rebobinar una generación">◀</button>
+            </div>
             <button id="resetBtn">REINICIAR MUNDO</button>
             <button id="pauseBtn" class="game-only">⏸ PAUSA</button>
+            <button id="screenshotBtn">📷 CAPTURAR PNG</button>
+            <button id="shareBtn">🔗 COMPARTIR</button>
             <div id="game-tooltip"></div>
         </div>
         <table id="stats">
@@ -185,12 +258,13 @@
         <div id="game-info" class="game-only">
             <table id="game-stats">
                 <tr class="stats-header">
-                    <td>Células</td><td>Objetivo</td><td>Puntos</td>
+                    <td>Células</td><td>Objetivo</td><td>Puntos</td><td>Récord</td>
                 </tr>
                 <tr class="stats-values">
                     <td><span id="cellsRemaining">0</span></td>
                     <td><span id="gameTarget">-</span></td>
                     <td><span id="gameScore">0</span></td>
+                    <td><span id="gameBest">-</span></td>
                 </tr>
             </table>
         </div>
